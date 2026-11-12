@@ -1,0 +1,11 @@
+{
+    "confianca": 0.8,
+    "tempo_limite": 5,
+    "atraso_etapa": 2,
+    "atraso_clique": 2,
+    "atraso_digitacao": 0.05,
+    "max_tentativas": 3,
+    "image_dir": "C:/Users/alex.israel/Desktop/Projetos/Outros/5 - estudo software/Antigo/imagens",
+    "log_file": "automation_log.log",
+    "save_base_path": "C:\\Users\\mb.contabilidade\\Desktop\\Recibos Destda"
+}
