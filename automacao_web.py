@@ -23,7 +23,7 @@ DEBUG_MODE = True  # Liga/Desliga logs
 IMAGE_DIR = "imagens"  # Pasta onde as imagens estão localizadas
 LOG_FILE = "automation_log.log" # Nome do arquivo de log
 DEFAULT_CONFIDENCE = 0.8  # Nível de confiança para encontrar imagens (0.0 a 1.0)
-DEFAULT_IMAGE_TIMEOUT = 5  # Tempo limite em segundos para encontrar uma imagem
+DEFAULT_IMAGE_TIMEOUT = 5 if DEBUG_MODE else 10  # Tempo limite em segundos para encontrar uma imagem
 DEFAULT_STEP_DELAY = 2  # Atraso em segundos entre as etapas principais
 DEFAULT_CLICK_DELAY = 2  # Atraso em segundos após cada clique
 TYPE_DELAY = 0.05  # Atraso em segundos entre a digitação de cada caractere
@@ -47,6 +47,7 @@ CONFIG_GERAL = {
     "atraso_clique": DEFAULT_CLICK_DELAY,
     "atraso_digitacao": TYPE_DELAY,
     "max_tentativas": MAX_ATTEMPTS_PER_STEP,
+    "ignorar_skipped": True,
     "image_dir": IMAGE_DIR,
     "log_file": LOG_FILE,
     "save_base_path": SAVE_BASE_PATH  # Caminho base para salvar arquivos gerados
@@ -59,9 +60,20 @@ CONFIG_NOME = {
     "atraso_clique": "Atraso após Clique (segundos)",
     "atraso_digitacao": "Atraso de Digitação (segundos)",
     "max_tentativas": "Máximo de Tentativas",
+    "ignorar_skipped": "Ignorar Etapas Puladas",
     "image_dir": "Diretório de Imagens",
     "log_file": "Arquivo de Log",
     "save_base_path": "Caminho Base para Salvamento"
+}
+
+LIMITES_CONFIG = {
+    "confianca": (0.0, 1.0),
+    "tempo_limite": (0, 30),
+    "atraso_etapa": (0, 10),
+    "atraso_clique": (0, 10),
+    "atraso_digitacao": (0, 5),
+    "ignorar_skipped": (False, True),
+    "max_tentativas": (1, 10)
 }
 
 # --- Exceções Customizadas ---
@@ -196,11 +208,16 @@ class WebAutomation:
             default_value = CONFIG_GERAL[key]
             try:
                 if isinstance(default_value, bool):
-                    value = value.lower() in ("true", "1", "sim", "yes")
+                    value = bool(value)
                 elif isinstance(default_value, int):
                     value = int(value)
                 elif isinstance(default_value, float):
                     value = float(value)
+                # Verifica se o valor está dentro dos limites permitidos
+                if key in LIMITES_CONFIG:
+                    min_val, max_val = LIMITES_CONFIG[key]
+                    if not (min_val <= value <= max_val):
+                        raise ValueError(f"Valor fora dos limites para '{CONFIG_NOME[key]}': {value} (permitido: {min_val} a {max_val})")
             except ValueError as e:
                 raise ValueError(f"Valor inválido para '{CONFIG_NOME[key]}': {value}") from e
             self.config[key] = value
@@ -208,6 +225,10 @@ class WebAutomation:
 
         with open(self.config_file_path, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, indent=4, ensure_ascii=False)
+
+    def default_config(self):
+        """Retorna a configuração padrão."""
+        return CONFIG_GERAL.copy()
 
     def reset_counters(self):
         self.gui.reset_counters()  # Reseta os contadores na GUI
@@ -256,7 +277,7 @@ class WebAutomation:
         """Envia mensagens para o logger e para a interface gráfica."""
         if self.gui:
             # Garante que a atualização da GUI ocorra na thread principal
-            self.gui.after(0, self.gui.update_log, message)
+            self.gui.after(0, lambda: self.gui.update_log(message, level))
         if level == "INFO":
             self.logger.info(message)
         elif level == "WARNING":
@@ -368,6 +389,7 @@ class WebAutomation:
                 self.gui.tools_window.geometry("-150+0")
                 self.gui.tool_button_retry.config(state=tk.DISABLED)
                 self.gui.tool_button_skip.config(state=tk.DISABLED)
+                self.gui.hit_error = False
                 if action == "Parar":
                     self.stop_automation()
                     if self.gui.tools_window.winfo_exists():
@@ -780,16 +802,20 @@ class WebAutomation:
 
                 current_status = row[COL_STATUS]
                 # Ignora linhas já processadas ou puladas
-                if isinstance(current_status, str) and current_status.lower() in ["ok", "skipped"]:
-                    self.log_message("INFO",
-                                     f"Linha {index + 2} (Empresa: {row[COL_EMPRESA]}) já está com status '{current_status}'. Pulando para a próxima.")
-                    self.gui.after(0, self.gui.update_progress, index + 1)
+                if isinstance(current_status, str):
                     if current_status.lower() == "ok":
                         self.gui.count_ok += 1
+                        self.log_message("INFO", f"Linha {index + 2} (Empresa: {row[COL_EMPRESA]}) já está com status '{current_status}'. Pulando para a próxima.")
+                        continue
                     elif current_status.lower() == "skipped":
                         self.gui.count_skip += 1
-                    continue
-
+                        print("valor do self.config['ignorar_skipped']:", self.config["ignorar_skipped"])
+                        if self.config["ignorar_skipped"]:
+                            self.log_message("INFO", f"Linha {index + 2} (Empresa: {row[COL_EMPRESA]}) já está com status '{current_status}'. Pulando para a próxima.")
+                            continue
+                    elif current_status.lower() == "error":
+                        self.gui.count_error += 1
+                    self.gui.after(0, self.gui.update_progress, index + 1)
                 self.run_automation_for_row(index, row)
 
             self.log_message("INFO", "Processo de automação finalizado.")
@@ -833,7 +859,8 @@ class AutomationGUI(tk.Tk):
         self.excel_file_path = None
         self.running = False  # Estado da automação
         self.tools_response_queue = Queue()
-
+        self.hit_error = False
+        self._centralize_after_id = None
 
         # Contagem para os cards
         self.count_total = 0
@@ -848,7 +875,7 @@ class AutomationGUI(tk.Tk):
         image_dir = self.automation.image_dir
         if not image_dir.is_dir():
             image_dir.mkdir(exist_ok=True)
-            self.update_log(f"Diretório '{image_dir}' criado (se não existia).")
+            self.update_log(f"Diretório '{image_dir}' criado (se não existia).", "INFO")
 
     def _create_widgets(self):
         """Cria todos os componentes da interface gráfica."""
@@ -915,7 +942,7 @@ class AutomationGUI(tk.Tk):
 
         self.more_config = ttk.Button(self.config_frame, text="⚙ Config", cursor="hand2", width=10, command=self.open_config_window)
 
-        self.status_label = ttk.Label(self.config_frame, text="Status: Aguardando planilha...")
+        self.status_label = ttk.Label(self.config_frame, text="Aguardando planilha...", foreground="red")
         self.progress_bar = ttk.Progressbar(self.config_frame, orient="horizontal", length=300, mode="determinate")
         self.progress_label = ttk.Label(self.config_frame, text="0/0")
         self.timer_label = ttk.Label(self.config_frame, text="Tempo decorrido: 00:00:00")
@@ -940,9 +967,14 @@ class AutomationGUI(tk.Tk):
         self.log_frame = ttk.LabelFrame(self, text="Logs de Operação")
         self.log_frame.pack(padx=10, pady=10, fill="both", expand=True)
 
-        self.log_text = tk.Text(self.log_frame, state="disabled", wrap="word", height=20, width=67)
+        self.log_text = tk.Text(self.log_frame, state="disabled", wrap="word", height=20, width=67, bg="#1e1e1e", fg="#d4d4d4", font=("Consolas", 10), insertbackground="white")
         self.log_text_scroll = ttk.Scrollbar(self.log_frame, command=self.log_text.yview)
         self.log_text.config(yscrollcommand=self.log_text_scroll.set)
+
+        self.log_text.tag_config("INFO", foreground="#9cdcfe")
+        self.log_text.tag_config("WARNING", foreground="#dcdcaa")
+        self.log_text.tag_config("ERROR", foreground="#f48771")
+        self.log_text.tag_config("TIME", foreground="#606060")
 
         # Frame para a tabela de dados
         self.table_frame = ttk.LabelFrame(self, text="Dados da Planilha")
@@ -978,6 +1010,14 @@ class AutomationGUI(tk.Tk):
                 text=f"{CONFIG_NOME[key]}:"
             ).grid(row=row, column=0, sticky="w", padx=2, pady=2)
 
+            if key == "ignorar_skipped":
+                var = tk.BooleanVar(value=value)
+                check = ttk.Checkbutton(frame, variable=var)
+                check.grid(row=row, column=1, sticky="w", padx=2, pady=2)
+                self.config_entries[key] = var
+                row += 1
+                continue
+
             entry = ttk.Entry(frame, width=30)
             entry.insert(0, str(value))
             entry.grid(row=row, column=1, sticky="w", padx=2, pady=2)
@@ -1005,6 +1045,11 @@ class AutomationGUI(tk.Tk):
             text="Salvar",
             command=self.save_config
         ).grid(row=0, column=1, padx=2)
+        ttk.Button(
+            buttons_frame,
+            text="Restaurar Padrão",
+            command=self.restore_default_config
+        ).grid(row=0, column=2, padx=2)
 
     def select_folder(self, key):
         """Seleciona uma pasta e atualiza o campo correspondente."""
@@ -1015,6 +1060,12 @@ class AutomationGUI(tk.Tk):
             self.config_entries[key].delete(0, tk.END)
             self.config_entries[key].insert(0, folder_path)
 
+    def restore_default_config(self):
+        """Restaura as configurações para os valores padrão."""
+        for key, value in self.automation.default_config().items():
+            self.config_entries[key].delete(0, tk.END)
+            self.config_entries[key].insert(0, str(value))
+        
     def save_config(self):
         """Salva as configurações adicionais no arquivo de configuração."""
         values = {key: entry.get() for key, entry in self.config_entries.items()}
@@ -1092,6 +1143,8 @@ class AutomationGUI(tk.Tk):
     def load_table_data(self, df):
         """Carrega os dados do DataFrame na tabela Treeview."""
         # Limpa a tabela antes de carregar novos dados
+        self.count_total = 0  # Reinicia o contador total
+
         for item in self.table.get_children():
             self.table.delete(item)
 
@@ -1152,26 +1205,27 @@ class AutomationGUI(tk.Tk):
         self.geometry("")
         self.button_hide_logs.config(text="Ocultar Logs", command=self.hide_logs)
 
-    def update_log(self, message):
+    def update_log(self, message, level="INFO"):
         """Adiciona uma mensagem ao Text widget de logs."""
         self.log_text.configure(state="normal")
-        self.log_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} - {message}\n")
+        self.log_text.insert(tk.END, datetime.now().strftime('%H:%M:%S') + " - ", "TIME")
+        self.log_text.insert(tk.END, message + "\n", level)
         self.log_text.see(tk.END)  # Rola para o final
         self.log_text.configure(state="disabled")
         # Não precisa de update_idletasks() aqui, pois já é chamado via after(0)
 
     def update_status_label(self, message):
         """Atualiza o texto do label de status."""
-        self.status_label.config(text=f"Status: {message}")
+        self.status_label.config(text=f"{message}")
         if hasattr(self, 'status_error_label') and self.status_error_label.winfo_exists():
-            self.status_error_label.config(text=f"Status: {message}")  # Limpa a mensagem de erro se houver
+            self.status_error_label.config(text=f"{message}")  # Limpa a mensagem de erro se houver
 
     def update_progress_bar_max(self, max_value):
         """Configura o valor máximo da barra de progresso."""
         self.progress_bar["maximum"] = max_value
         self.progress_bar["value"] = 0
         self.progress_label.config(text=f"0/{max_value}")
-        if hasattr(self, 'label_progress'):
+        if hasattr(self, 'label_progress') and self.label_progress.winfo_exists():
             self.label_progress.config(text=f"0/{max_value}")
 
     def update_progress(self, current_value):
@@ -1210,8 +1264,6 @@ class AutomationGUI(tk.Tk):
             self.spinbox_mes.config(state=tk.DISABLED)
             self.spinbox_ano.config(state=tk.DISABLED)
             self.open_tools_toplevel_window.config(state=tk.DISABLED)
-            self.spinbox_ano.config(state=tk.NORMAL if self.excel_file_path else tk.DISABLED)
-            self.spinbox_mes.config(state=tk.NORMAL if self.excel_file_path else tk.DISABLED)
             if hasattr(self, 'tools_window') and self.tools_window.winfo_exists():
                 self.tool_button_retry.config(state=tk.DISABLED)
                 self.tool_button_skip.config(state=tk.DISABLED)
@@ -1229,7 +1281,7 @@ class AutomationGUI(tk.Tk):
                 self.btn_start.config(state=tk.NORMAL)
                 self.button_hide_table.config(state=tk.NORMAL)  # Permite que o usuário veja a tabela de dados
 
-                self.update_log(f"Planilha {Path(file_path).name} carregada com sucesso.")
+                self.update_log(f"Planilha {Path(file_path).name} carregada com sucesso.", "INFO")
                 self.load_table_data(self.automation.df)  # Atualiza a tabela com os dados carregados
                 self.after(0, self.show_table)  # Exibe a tabela automaticamente após o carregamento
                 self.update_progress_bar_max(len(self.automation.df))
@@ -1242,50 +1294,64 @@ class AutomationGUI(tk.Tk):
 
         self.button_hide_logs.config(state=tk.NORMAL)  # Permite que o usuário veja os logs de erro
 
+    def centraliza_widget(self, widget):
+        def center():
+            self._centralize_after_id = None
+            if not widget.winfo_exists():
+                return
+
+            widget.update_idletasks()
+
+            width = widget.winfo_width()
+            height = widget.winfo_height()
+            x = (widget.winfo_screenwidth() - width) // 2
+            y = (widget.winfo_screenheight() - height) // 2
+
+            widget.geometry(f"{width}x{height}+{x}+{y}")
+
+        if self._centralize_after_id is not None:
+            self.after_cancel(self._centralize_after_id)
+        self._centralize_after_id = self.after(0, center)
+
     def show_tools_error(self, step_name):
         """Exibe a janela de ferramentas com opções de retry, skip ou stop."""
+        self.hit_error = True
         if not hasattr(self, 'tools_window') or not self.tools_window.winfo_exists():
-            self.open_tools_toplevel()
+            self.after(0, self.open_tools_toplevel)
 
-        def centraliza_widget(self, widget):
-            def center():
-                if not widget.winfo_exists():
-                    return
-
-                widget.update_idletasks()
-
-                width = widget.winfo_width()
-                height = widget.winfo_height()
-                x = (widget.winfo_screenwidth() - width) // 2
-                y = (widget.winfo_screenheight() - height) // 2
-
-                widget.geometry(f"{width}x{height}+{x}+{y}")
-
-            self.after(0, center)
-            self.after(0, lambda: self.tool_button_retry.config(state=tk.NORMAL))
-            self.after(0, lambda: self.tool_button_skip.config(state=tk.NORMAL))
+        self.tool_button_retry.config(state=tk.NORMAL)
+        self.tool_button_skip.config(state=tk.NORMAL)
 
         if hasattr(self, 'tools_window') and self.tools_window.winfo_exists():
-            centraliza_widget(self, self.tools_window)
+            self.centraliza_widget(self.tools_window)
 
         self.after(0, lambda: self.status_error_label.config(text=f"Erro na etapa: {step_name}"))
 
         command = self.tools_response_queue.get()  # Bloqueia até que o usuário escolha uma opção
         match command:
             case "retry":
-                self.update_log(f"Usuário escolheu: Tentar Novamente na etapa '{step_name}'")
+                self.update_log(f"Usuário escolheu: Tentar Novamente na etapa '{step_name}'", "INFO")
                 return "Tentar Novamente"
             case "skip":
-                self.update_log(f"Usuário escolheu: Pular Etapa '{step_name}'")
+                self.update_log(f"Usuário escolheu: Pular Etapa '{step_name}'", "INFO")
                 return "Pular"
             case "stop":
-                self.update_log(f"Usuário escolheu: Parar Automação na etapa '{step_name}'")
+                self.update_log(f"Usuário escolheu: Parar Automação na etapa '{step_name}'", "INFO")
                 return "Parar"
 
     def open_tools_toplevel(self):
+        if hasattr(self, 'tools_window') and self.tools_window.winfo_exists():
+            self.tools_window.lift()  # Traz a janela existente para frente
+            if self.hit_error:
+                self.centraliza_widget(self.tools_window)
+            return
+        
         self.tools_window = tk.Toplevel(self)
         self.tools_window.attributes("-topmost", True)  # Mantém a janela de ferramentas sempre no topo
-        self.tools_window.geometry("-150+0")
+        if self.hit_error:
+            self.centraliza_widget(self.tools_window)
+        else:
+            self.tools_window.geometry("-150+0")
         self.tools_window.config(borderwidth=3, relief="raised")
         self.tools_window.overrideredirect(True)
         self.tools_window.resizable(False, False)
@@ -1302,8 +1368,8 @@ class AutomationGUI(tk.Tk):
         # BOTOES DE CONTROLE
         self.frame = ttk.Frame(self.tools_window)
         self.frame.pack(fill="x", expand=True)
-        self.tool_button_retry = ttk.Button(self.frame, text="Tentar Novamente", command=lambda: self.send_tool_command("retry"), state=tk.DISABLED)
-        self.tool_button_skip = ttk.Button(self.frame, text="Pular Etapa", command=lambda: self.send_tool_command("skip"), state=tk.DISABLED)
+        self.tool_button_retry = ttk.Button(self.frame, text="Tentar Novamente", command=lambda: self.send_tool_command("retry"), state=tk.DISABLED if not self.hit_error else tk.NORMAL)
+        self.tool_button_skip = ttk.Button(self.frame, text="Pular Etapa", command=lambda: self.send_tool_command("skip"), state=tk.DISABLED if not self.hit_error else tk.NORMAL)
         self.tool_button_stop = ttk.Button(self.frame, text="Parar Automação", command=lambda: self.send_tool_command("stop"))
         self.tool_button_close = ttk.Button(self.frame, text="Fechar", command=self.fechar_tools_toplevel)
         self.tool_button_retry.pack(pady=5, side="left")
@@ -1318,8 +1384,12 @@ class AutomationGUI(tk.Tk):
 
     def fechar_tools_toplevel(self):
         """Fecha a janela Toplevel de ferramentas, se estiver aberta."""
+        if self._centralize_after_id is not None:
+            self.after_cancel(self._centralize_after_id)
+            self._centralize_after_id = None
         if hasattr(self, 'tools_window') and self.tools_window.winfo_exists():
             self.tools_window.destroy()
+            del self.tools_window
         self.deiconify()  # Traz a janela principal de volta à frente, DEIXAR OPCIONAL
 
     def start_automation_threaded(self):
@@ -1334,7 +1404,7 @@ class AutomationGUI(tk.Tk):
         automation_thread.daemon = True  # Permite que o programa principal saia mesmo se a thread estiver rodando
         automation_thread.start()
         self.set_automation_running(True)
-        self.update_log("Thread de automação iniciada.")
+        self.update_log("Thread de automação iniciada.", "INFO")
 
     def stop_automation(self):
         """Solicita à thread de automação que pare."""
@@ -1354,7 +1424,7 @@ class AutomationGUI(tk.Tk):
             elif status == "ok":
                 self.table.item(item_id, tags=('par' if row_index % 2 == 0 else 'impar',))
         else:
-            self.update_log(f"Índice de linha inválido para atualização de STATUS: {row_index}")
+            self.update_log(f"Índice de linha inválido para atualização de STATUS: {row_index}", "ERROR")
 
 def main():
     # --- Ponto de Entrada Principal ---
